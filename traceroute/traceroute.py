@@ -19,6 +19,7 @@ TRACEROUTE_PORT_NUMBER = 33434  # Cisco traceroute port number.
 PROBE_ATTEMPT_COUNT = 3
 
 class IPv4:
+    """IPv4 packet header parser."""
     # Each member below is a field from the IPv4 packet header.  They are
     # listed below in the order they appear in the packet.  All fields should
     # be stored in host byte order.
@@ -38,7 +39,20 @@ class IPv4:
     dst: str
 
     def __init__(self, buffer: bytes):
-        pass  # TODO
+        bitstring = ''.join(format(byte, '08b') for byte in [*buffer])
+        self.version = int(bitstring[:4], 2)
+        self.header_len = int(bitstring[4 : 8], 2)
+        self.tos = int(bitstring[8 : 16], 2)
+        self.length = int(bitstring[16 : 32], 2)
+        self.id = int(bitstring[32 : 48], 2)
+        self.flags = int(bitstring[48 : 51], 2)
+        self.frag_offset = int(bitstring[51 : 64], 2)
+        self.ttl = int(bitstring[64 : 72], 2)
+        self.proto = int(bitstring[72 : 80], 2)
+        self.cksum = int(bitstring[80 : 96], 2)
+        self.src = util.inet_ntoa(buffer[12 : 16])
+
+        self.dst = util.inet_ntoa(buffer[16 : 20])
 
     def __str__(self) -> str:
         return f"IPv{self.version} (tos 0x{self.tos:x}, ttl {self.ttl}, " + \
@@ -50,6 +64,7 @@ class IPv4:
 
 
 class ICMP:
+    """ICMP packet header parser."""
     # Each member below is a field from the ICMP header.  They are listed below
     # in the order they appear in the packet.  All fields should be stored in
     # host byte order.
@@ -60,7 +75,11 @@ class ICMP:
     cksum: int
 
     def __init__(self, buffer: bytes):
-        pass  # TODO
+        bitstring = ''.join(format(byte, '08b') for byte in [*buffer])
+
+        self.type = int(bitstring[0 : 8], 2)
+        self.code = int(bitstring[8 : 16], 2)
+        self.cksum = int(bitstring[16 : 32], 2)
 
     def __str__(self) -> str:
         return f"ICMP (type {self.type}, code {self.code}, " + \
@@ -68,6 +87,7 @@ class ICMP:
 
 
 class UDP:
+    """UDP packet header parser."""
     # Each member below is a field from the UDP header.  They are listed below
     # in the order they appear in the packet.  All fields should be stored in
     # host byte order.
@@ -79,13 +99,53 @@ class UDP:
     cksum: int
 
     def __init__(self, buffer: bytes):
-        pass  # TODO
+        bitstring = ''.join(format(byte, '08b') for byte in [*buffer])
+        self.src_port = int(bitstring[0 : 16], 2)
+        self.dst_port = int(bitstring[16 : 32], 2)
+        self.len = int(bitstring[32 : 48], 2)
+        self.cksum = int(bitstring[48 : 64], 2)
 
     def __str__(self) -> str:
         return f"UDP (src_port {self.src_port}, dst_port {self.dst_port}, " + \
             f"len {self.len}, cksum 0x{self.cksum:x})"
 
-# TODO feel free to add helper functions if you'd like
+ICMP_TYPE_DESTINATION_UNREACHABLE = 3
+ICMP_TYPE_TIME_EXCEEDED = 11
+ICMP_CODE_TTL_TIME_EXCEEDED = 0
+
+IPV4_PROTOCOL_ICMP = 1
+IPV4_PROTOCOL_UDP = 17
+IPV4_MIN_TOTAL_PACKET_LENGTH = 20
+IPV4_WORDS_LENGTH = 4
+
+def is_valid_ip(ip_string):
+    """ Check if the IP address is valid. """
+    parts = ip_string.split('.')
+    # Check for exactly 4 parts
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        # Check for leading zeros (except for '0') and if part is a number
+        if not part.isdigit() or (len(part) > 1 and part.startswith('0')):
+            return False
+        # Check if the number is in the valid range
+        try:
+            num = int(part)
+            if not 0 <= num <= 255:
+                return False
+        except ValueError:
+            return False
+    return True
+
+def is_valid_icmp(icmp: ICMP):
+    """ Check if the ICMP packet is valid. """
+    if icmp.type not in (ICMP_TYPE_DESTINATION_UNREACHABLE, ICMP_TYPE_TIME_EXCEEDED):
+        return False
+    if icmp.type == ICMP_TYPE_TIME_EXCEEDED and icmp.code != ICMP_CODE_TTL_TIME_EXCEEDED:
+        return False
+
+    return True
+
 
 def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
         -> list[list[str]]:
@@ -107,11 +167,48 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
     should be included as the final element in the list.
     """
 
-    # TODO Add your implementation
+    all_routers = []
+    router_probed = set()
     for ttl in range(1, TRACEROUTE_MAX_TTL+1):
-        util.print_result([], ttl)
-    return []
+        ttl_routers = []
+        ip_exist = set()
+        for _ in range(PROBE_ATTEMPT_COUNT):
+            sendsock.set_ttl(ttl)
+            sendsock.sendto("Hello".encode(), (ip, TRACEROUTE_PORT_NUMBER))
+            while recvsock.recv_select():
+                buf, _ = recvsock.recvfrom()
 
+                recv_ip = IPv4(buf)
+                icmp_start = recv_ip.header_len * IPV4_WORDS_LENGTH
+                recv_icmp = ICMP(buf[icmp_start: icmp_start + 8])
+                # recv_src_ip = recv_ip.src
+                if not ((is_valid_ip(recv_ip.src)) and is_valid_icmp(recv_icmp)):
+                    continue
+
+                if is_valid_icmp(recv_icmp) and (recv_ip.proto != util.IPPROTO_ICMP):
+                    continue
+
+                if recv_ip.length < IPV4_MIN_TOTAL_PACKET_LENGTH:
+                    continue
+
+                if recv_ip.proto == util.IPPROTO_UDP:
+                    continue
+
+                # Duplicate check
+                if recv_ip.src not in ip_exist and \
+                str(ttl) + " " + recv_ip.src not in router_probed:
+                    ttl_routers.append(recv_ip.src)
+                    ip_exist.add(recv_ip.src)
+                    router_probed.add(str(ttl) + " " + recv_ip.src)
+                    # Reach destination
+                    if recv_ip.src == ip:
+                        all_routers.append(ttl_routers)
+                        return all_routers
+
+        util.print_result(ttl_routers, ttl)
+        all_routers.append(ttl_routers)
+
+    return all_routers
 
 if __name__ == '__main__':
     args = util.parse_args()
