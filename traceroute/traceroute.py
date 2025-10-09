@@ -1,3 +1,10 @@
+"""
+CS 168 Project 1: Traceroute Implementation
+
+This module implements a traceroute utility that discovers the network path
+to a destination by sending UDP probes with incrementing TTL values and
+processing ICMP Time Exceeded and Destination Unreachable responses.
+"""
 import util
 
 # Your program should send TTLs in the range [1, TRACEROUTE_MAX_TTL] inclusive.
@@ -112,11 +119,15 @@ class UDP:
 ICMP_TYPE_DESTINATION_UNREACHABLE = 3
 ICMP_TYPE_TIME_EXCEEDED = 11
 ICMP_CODE_TTL_TIME_EXCEEDED = 0
+ICMP_BYTES_LENGTH = 8
 
 IPV4_PROTOCOL_ICMP = 1
 IPV4_PROTOCOL_UDP = 17
 IPV4_MIN_TOTAL_PACKET_LENGTH = 20
 IPV4_WORDS_LENGTH = 4
+IPV4_BYTES_LENGTH = 20
+
+UDP_BYTES_LENGTH = 8
 
 def is_valid_ip(ip_string):
     """ Check if the IP address is valid. """
@@ -168,7 +179,6 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
     """
 
     all_routers = []
-    router_probed = set()
     for ttl in range(1, TRACEROUTE_MAX_TTL+1):
         ttl_routers = []
         ip_exist = set()
@@ -180,31 +190,52 @@ def traceroute(sendsock: util.Socket, recvsock: util.Socket, ip: str) \
 
                 recv_ip = IPv4(buf)
                 icmp_start = recv_ip.header_len * IPV4_WORDS_LENGTH
-                recv_icmp = ICMP(buf[icmp_start: icmp_start + 8])
-                # recv_src_ip = recv_ip.src
-                if not ((is_valid_ip(recv_ip.src)) and is_valid_icmp(recv_icmp)):
-                    continue
+                recv_icmp = ICMP(buf[icmp_start: icmp_start + ICMP_BYTES_LENGTH])
 
-                if is_valid_icmp(recv_icmp) and (recv_ip.proto != util.IPPROTO_ICMP):
+                # Basic validation first
+                if not is_valid_ip(recv_ip.src):
                     continue
-
+                if not is_valid_icmp(recv_icmp):
+                    continue
+                if recv_ip.proto != util.IPPROTO_ICMP:
+                    continue
                 if recv_ip.length < IPV4_MIN_TOTAL_PACKET_LENGTH:
                     continue
 
-                if recv_ip.proto == util.IPPROTO_UDP:
-                    continue
+                # Validate embedded packet (Test B16) - only reject if clearly wrong
+                embedded_ip_start = icmp_start + ICMP_BYTES_LENGTH
+                if len(buf) >= embedded_ip_start + IPV4_BYTES_LENGTH:
+                    try:
+                        embedded_ip = IPv4(buf[embedded_ip_start:])
 
-                # Duplicate check
-                if recv_ip.src not in ip_exist and \
-                str(ttl) + " " + recv_ip.src not in router_probed:
+                        # Only skip if we can prove this is NOT our packet
+                        # Check if it's UDP to our destination
+                        if embedded_ip.proto == util.IPPROTO_UDP:
+                            if embedded_ip.dst != ip:
+                                continue  # Wrong destination, skip
+
+                            # Check UDP port if available
+                            embedded_udp_start = embedded_ip.header_len * IPV4_WORDS_LENGTH
+                            min_len = embedded_ip_start + embedded_udp_start + UDP_BYTES_LENGTH
+                            if len(buf) >= min_len:
+                                try:
+                                    embedded_udp = UDP(buf[embedded_ip_start + embedded_udp_start:])
+                                    if embedded_udp.dst_port != TRACEROUTE_PORT_NUMBER:
+                                        continue  # Wrong port, skip
+                                except (ValueError, IndexError):
+                                    pass  # Can't parse UDP, allow packet
+                        # If not UDP or can't determine, allow the packet
+                    except (ValueError, IndexError):
+                        pass  # Can't parse embedded packet, allow packet
+
+                # Duplicate check (only within same TTL)
+                if recv_ip.src not in ip_exist:
                     ttl_routers.append(recv_ip.src)
                     ip_exist.add(recv_ip.src)
-                    router_probed.add(str(ttl) + " " + recv_ip.src)
                     # Reach destination
                     if recv_ip.src == ip:
                         all_routers.append(ttl_routers)
                         return all_routers
-
         util.print_result(ttl_routers, ttl)
         all_routers.append(ttl_routers)
 
